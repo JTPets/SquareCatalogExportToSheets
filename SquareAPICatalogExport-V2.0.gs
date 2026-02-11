@@ -9,7 +9,7 @@ function onOpen() {
     .addItem('Set Email Address', 'setEmailAddress')
     .addItem('Set Store Domain', 'setStoreDomain')
     .addItem('Start Processing', 'startProcessing')
-    .addItem('Set 3-Hour Timer', 'createDailyTrigger')
+    .addItem('Set Daily Timer', 'createDailyTrigger')
     .addSeparator()
     .addItem('🖼️ Populate Images from URLs', 'populateImagesFromUrls')
     .addItem('📂 Import Images from CSV', 'importImagesFromCsv')
@@ -165,45 +165,35 @@ function startProcessing() {
   }
 }
 
-// Function to create a time-driven trigger to refresh data every 3 hours
+// Function to create a time-driven trigger to refresh data once daily
 function createDailyTrigger() {
   var ui = SpreadsheetApp.getUi();
-  
+
   var response = ui.prompt(
-    'Set 3-Hour Refresh Schedule', 
-    'At what hour (0-23) would you like the 3-hour refresh cycle to start?\nRefresh will run every 3 hours from this time.\nExample: 6 = 6AM, 9AM, 12PM, 3PM, 6PM, 9PM, 12AM, 3AM', 
+    'Set Daily Refresh Schedule',
+    'At what hour (0-23) would you like the daily refresh to run?\nExample: 8 = 8:00 AM, 14 = 2:00 PM',
     ui.ButtonSet.OK_CANCEL
   );
-  
+
   if (response.getSelectedButton() == ui.Button.OK) {
     var hourText = response.getResponseText().trim();
     var startHour = parseInt(hourText, 10);
-    
+
     if (isNaN(startHour) || startHour < 0 || startHour > 23) {
       ui.alert('Error', 'Please enter a valid hour between 0 and 23.', ui.ButtonSet.OK);
       return;
     }
-    
+
     deleteExistingTriggers();
-    
-    var hours = [];
-    for (var i = 0; i < 24; i += 3) {
-      var hour = (startHour + i) % 24;
-      hours.push(hour);
-      
-      ScriptApp.newTrigger('startProcessing')
-        .timeBased()
-        .atHour(hour)
-        .everyDays(1)
-        .create();
-    }
-    
-    var displayTimes = hours.map(function(hour) {
-      return formatHourForDisplay(hour);
-    }).join(', ');
-    
-    ui.alert('Success', 'Refresh schedule set for every 3 hours starting at ' + formatHourForDisplay(startHour) + '.\n\nRefresh times: ' + displayTimes, ui.ButtonSet.OK);
-    Logger.log('3-hour triggers created starting at hour: ' + startHour + '. All hours: ' + hours.join(', '));
+
+    ScriptApp.newTrigger('startProcessing')
+      .timeBased()
+      .atHour(startHour)
+      .everyDays(1)
+      .create();
+
+    ui.alert('Success', 'Daily refresh scheduled for ' + formatHourForDisplay(startHour) + '.', ui.ButtonSet.OK);
+    Logger.log('Daily trigger created at hour: ' + startHour);
   } else {
     ui.alert('Operation cancelled.');
   }
@@ -520,53 +510,47 @@ function fetchItemWithImages(itemId) {
   return [];
 }
 
+// Fetch inventory counts using batch endpoint (100 variations per call instead of 1)
 function fetchInventoryCountsForAllVariations(variationMap, locationIds, progressSheet) {
   var inventoryMap = {};
   var variationIds = Object.keys(variationMap);
-  var headers = {
-    "Square-Version": "2023-10-18",
-    "Content-Type": "application/json"
-  };
-
+  var batchSize = 100;
   var variationsProcessed = 0;
 
-  for (var i = 0; i < variationIds.length; i++) {
-    var variationId = variationIds[i];
-
+  for (var i = 0; i < variationIds.length; i += batchSize) {
+    // Check stop flag once per batch
     var stopFlag = progressSheet.getRange('B5').getValue().toString().toUpperCase();
     if (stopFlag === 'STOP') {
       Logger.log('Processing halted by user during inventory fetching.');
       break;
     }
 
-    if (i > 0 && i % 50 == 0) {
-      Logger.log('Sleeping for 2 seconds to avoid rate limits...');
-      Utilities.sleep(2000);
-    }
-
+    var batch = variationIds.slice(i, Math.min(i + batchSize, variationIds.length));
     var cursor = null;
-    var retryCount = 0;
-    var maxRetries = 3;
-    
+
     do {
-      var url = 'https://connect.squareup.com/v2/inventory/' + variationId;
-      if (locationIds.length > 0) {
-        url += '?location_ids=' + locationIds.join(',');
-      }
+      var url = 'https://connect.squareup.com/v2/inventory/batch-retrieve-counts';
+      var payload = {
+        "catalog_object_ids": batch,
+        "location_ids": locationIds
+      };
       if (cursor) {
-        url += (locationIds.length > 0 ? '&' : '?') + 'cursor=' + cursor;
+        payload.cursor = cursor;
       }
 
       var options = {
-        "method": "GET",
-        "headers": headers,
+        "method": "POST",
+        "headers": {
+          "Square-Version": "2023-10-18",
+          "Content-Type": "application/json"
+        },
+        "payload": JSON.stringify(payload),
         "muteHttpExceptions": true
       };
 
       var response = makeApiRequest(url, options);
-      var statusCode = response.getResponseCode();
 
-      if (statusCode === 200) {
+      if (response.getResponseCode() === 200) {
         var data = JSON.parse(response.getContentText());
         if (Array.isArray(data.counts)) {
           data.counts.forEach(function(count) {
@@ -579,31 +563,23 @@ function fetchInventoryCountsForAllVariations(variationMap, locationIds, progres
           });
         }
         cursor = data.cursor || null;
-        retryCount = 0;
-      } else if (statusCode === 429 || statusCode >= 500) {
-        retryCount++;
-        if (retryCount <= maxRetries) {
-          var waitTime = Math.pow(2, retryCount) * 1000;
-          Logger.log("API error " + statusCode + " for variation " + variationId + ". Retrying in " + (waitTime/1000) + " seconds... (attempt " + retryCount + "/" + maxRetries + ")");
-          Utilities.sleep(waitTime);
-          continue;
-        } else {
-          Logger.log("Max retries exceeded for variation ID " + variationId + ". Skipping...");
-          break;
-        }
       } else {
-        Logger.log("Error retrieving inventory count for variation ID " + variationId + ": " + response.getContentText());
+        Logger.log("Error retrieving inventory counts for batch at index " + i + ": " + response.getContentText());
         break;
       }
-    } while (cursor && retryCount <= maxRetries);
+    } while (cursor);
 
-    variationsProcessed++;
+    variationsProcessed += batch.length;
 
-    if (variationsProcessed % 100 === 0) {
-      var progressPercent = Math.round((variationsProcessed / variationIds.length) * 100);
-      progressSheet.getRange('B2').setValue(variationsProcessed);
-      progressSheet.getRange('B3').setValue(progressPercent);
-      SpreadsheetApp.flush();
+    // Update progress every batch
+    var progressPercent = Math.round((variationsProcessed / variationIds.length) * 100);
+    progressSheet.getRange('B2').setValue(variationsProcessed);
+    progressSheet.getRange('B3').setValue(progressPercent);
+    SpreadsheetApp.flush();
+
+    // Brief pause between batches to stay within rate limits
+    if (i + batchSize < variationIds.length) {
+      Utilities.sleep(500);
     }
   }
 
@@ -618,8 +594,8 @@ function processAndWriteData(sheet, variationMap, locationIds, inventoryMap, pro
     "Variation ID (ID-B)", "Item ID (ID-A)", "Title", "Link", "Description", "Variation Name", "Price (CAD)",
     "GTIN (UPC/EAN/ISBN)", "SKU", "Custom Attributes", "Item Options", "Modifier Lists", "Product Type", "Measurement Unit",
     "Pricing Type", "Visibility", "Available Online", "Available for Pickup", "Updated At", "is_deleted",
-    "catalog_v1_ids", "present_at_all_locations", "item_visibility", "category_id", "category_name",
-    "modifier_list_info", "product_type", "skip_modifier_screen", "tax_ids", "item_option_values"
+    "catalog_v1_ids", "present_at_all_locations", "category_id", "category_name",
+    "skip_modifier_screen", "tax_ids", "item_option_values"
   ];
 
   locationIds.forEach(function(locationId) {
@@ -685,8 +661,8 @@ function processAndWriteData(sheet, variationMap, locationIds, inventoryMap, pro
         variationData.sku, variationData.customAttributes, variationData.itemOptions, variationData.modifierListInfo,
         variationData.productType, variationData.measurementUnitId, variationData.pricingType, variationData.itemVisibility,
         variationData.availableOnline, variationData.availableForPickup, variationData.updatedAt, variationData.isDeleted,
-        variationData.catalogV1Ids, variationData.presentAtAllLocations, variationData.itemVisibility,
-        variationData.categoryId, variationData.categoryName, variationData.modifierListInfo, variationData.productType,
+        variationData.catalogV1Ids, variationData.presentAtAllLocations,
+        variationData.categoryId, variationData.categoryName,
         variationData.skipModifierScreen, variationData.taxIds, variationData.itemOptionValues
       ].concat(locationOverrides, activeStatuses, inventoryCounts, variationData.images);
 
@@ -790,25 +766,33 @@ function makeApiRequest(url, options) {
 
   options.headers["Authorization"] = "Bearer " + accessToken;
 
-  var response = UrlFetchApp.fetch(url, options);
-  var statusCode = response.getResponseCode();
+  var maxRetries = 3;
 
-  if (statusCode === 401) {
-    var emailAddress = documentProperties.getProperty('NOTIFICATION_EMAIL');
+  for (var attempt = 0; attempt <= maxRetries; attempt++) {
+    var response = UrlFetchApp.fetch(url, options);
+    var statusCode = response.getResponseCode();
 
-    if (emailAddress) {
-      MailApp.sendEmail({
-        to: emailAddress,
-        subject: "Square Data Refresh Failed - Invalid Access Token",
-        body: "The access token used for the Square API is invalid or expired. Please update it using the 'Set API Key' option in the 'Square API' menu."
-      });
+    if (statusCode >= 200 && statusCode < 300) {
+      return response;
+    } else if (statusCode === 401) {
+      var emailAddress = documentProperties.getProperty('NOTIFICATION_EMAIL');
+
+      if (emailAddress) {
+        MailApp.sendEmail({
+          to: emailAddress,
+          subject: "Square Data Refresh Failed - Invalid Access Token",
+          body: "The access token used for the Square API is invalid or expired. Please update it using the 'Set API Key' option in the 'Square API' menu."
+        });
+      }
+      throw new Error('Access token is invalid or expired.');
+    } else if ((statusCode === 429 || statusCode >= 500) && attempt < maxRetries) {
+      var waitTime = Math.pow(2, attempt + 1) * 1000;
+      Logger.log('API request returned ' + statusCode + '. Retrying in ' + (waitTime / 1000) + 's (attempt ' + (attempt + 1) + '/' + maxRetries + ')');
+      Utilities.sleep(waitTime);
+    } else {
+      Logger.log('API request failed with status code ' + statusCode + ': ' + response.getContentText());
+      throw new Error('API request failed with status code ' + statusCode);
     }
-    throw new Error('Access token is invalid or expired.');
-  } else if (statusCode >= 200 && statusCode < 300) {
-    return response;
-  } else {
-    Logger.log('API request failed with status code ' + statusCode + ': ' + response.getContentText());
-    throw new Error('API request failed with status code ' + statusCode);
   }
 }
 

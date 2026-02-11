@@ -516,8 +516,8 @@ function processAndWriteData(sheet, variationMap, locationIds, inventoryMap, pro
     "Variation ID (ID-B)", "Item ID (ID-A)", "Title", "Link", "Description", "Variation Name", "Price (CAD)",
     "GTIN (UPC/EAN/ISBN)", "SKU", "Custom Attributes", "Item Options", "Modifier Lists", "Product Type", "Measurement Unit",
     "Pricing Type", "Visibility", "Available Online", "Available for Pickup", "Updated At", "is_deleted",
-    "catalog_v1_ids", "present_at_all_locations", "item_visibility", "category_id", "category_name",
-    "modifier_list_info", "product_type", "skip_modifier_screen", "tax_ids", "item_option_values"
+    "catalog_v1_ids", "present_at_all_locations", "category_id", "category_name",
+    "skip_modifier_screen", "tax_ids", "item_option_values"
   ];
 
   // Add columns for location overrides for each location
@@ -593,8 +593,8 @@ function processAndWriteData(sheet, variationMap, locationIds, inventoryMap, pro
         variationData.sku, variationData.customAttributes, variationData.itemOptions, variationData.modifierListInfo,
         variationData.productType, variationData.measurementUnitId, variationData.pricingType, variationData.itemVisibility,
         variationData.availableOnline, variationData.availableForPickup, variationData.updatedAt, variationData.isDeleted,
-        variationData.catalogV1Ids, variationData.presentAtAllLocations, variationData.itemVisibility,
-        variationData.categoryId, variationData.categoryName, variationData.modifierListInfo, variationData.productType,
+        variationData.catalogV1Ids, variationData.presentAtAllLocations,
+        variationData.categoryId, variationData.categoryName,
         variationData.skipModifierScreen, variationData.taxIds, variationData.itemOptionValues
       ].concat(locationOverrides, activeStatuses, inventoryCounts, variationData.images);
 
