@@ -373,12 +373,19 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap, progr
 
       var imageUrls = [];
 
-      // Phase 1: Check if item has image_ids in the already-fetched imageMap
+      // Phase 1a: Check if item has image_ids in the already-fetched imageMap
       if (Array.isArray(item.image_ids) && item.image_ids.length > 0) {
         item.image_ids.forEach(function(imageId) {
           if (imageMap[imageId] && imageMap[imageId].url) {
             imageUrls.push(imageMap[imageId].url);
           }
+        });
+      }
+
+      // Phase 1b: Fallback to ecom_image_uris (direct URLs, no API calls needed)
+      if (imageUrls.length === 0 && Array.isArray(item.item_data.ecom_image_uris) && item.item_data.ecom_image_uris.length > 0) {
+        item.item_data.ecom_image_uris.forEach(function(uri) {
+          if (uri) imageUrls.push(uri);
         });
       }
 
@@ -597,17 +604,24 @@ function batchFetchItemImages(itemIds, progressSheet) {
     }
   }
 
-  // Phase 2b: Individual fetch for items that still lack image_ids
-  // When fetching a single item, all IMAGE related_objects belong to it
+  // Phase 2b: Parallel fetch for items that still lack image_ids
+  // Uses UrlFetchApp.fetchAll() to send multiple requests simultaneously.
+  // When fetching a single item, all IMAGE related_objects belong to it,
+  // so each request in the parallel batch targets exactly one item.
   if (remainingItemIds.length > 0) {
     Logger.log("Phase 2b: Individual image fetch for " + remainingItemIds.length + " items without image_ids");
     if (progressSheet) {
-      updateStatus(progressSheet, 'Fetching individual images...', '0 / ' + remainingItemIds.length + ' items');
+      updateStatus(progressSheet, 'Fetching individual images (parallel)...', '0 / ' + remainingItemIds.length + ' items');
     }
 
-    for (var j = 0; j < remainingItemIds.length; j++) {
-      // Check stop flag every 10 items
-      if (progressSheet && j % 10 === 0) {
+    var docProps = PropertiesService.getDocumentProperties();
+    var accessToken = docProps.getProperty('SQUARE_ACCESS_TOKEN');
+    var PARALLEL_SIZE = 25;
+    var phase2bProcessed = 0;
+
+    for (var j = 0; j < remainingItemIds.length; j += PARALLEL_SIZE) {
+      // Check stop flag once per parallel batch
+      if (progressSheet) {
         var stopFlag2 = progressSheet.getRange('B5').getValue().toString().toUpperCase();
         if (stopFlag2 === 'STOP') {
           Logger.log('Processing halted by user during individual image fetch.');
@@ -615,32 +629,64 @@ function batchFetchItemImages(itemIds, progressSheet) {
         }
       }
 
+      var parallelBatch = remainingItemIds.slice(j, Math.min(j + PARALLEL_SIZE, remainingItemIds.length));
+
+      // Build requests for parallel execution
+      var requests = parallelBatch.map(function(itemId) {
+        return {
+          'url': 'https://connect.squareup.com/v2/catalog/batch-retrieve',
+          'method': 'post',
+          'headers': {
+            'Authorization': 'Bearer ' + accessToken,
+            'Square-Version': '2023-10-18',
+            'Content-Type': 'application/json'
+          },
+          'payload': JSON.stringify({
+            'object_ids': [itemId],
+            'include_related_objects': true
+          }),
+          'muteHttpExceptions': true
+        };
+      });
+
       try {
-        var singleData = catalogBatchRetrieve([remainingItemIds[j]]);
+        var responses = UrlFetchApp.fetchAll(requests);
 
-        var imageUrls = [];
-        if (Array.isArray(singleData.related_objects)) {
-          singleData.related_objects.forEach(function(obj) {
-            if (obj.type === 'IMAGE' && obj.image_data && obj.image_data.url) {
-              imageUrls.push(obj.image_data.url);
+        for (var k = 0; k < responses.length; k++) {
+          try {
+            if (responses[k].getResponseCode() === 200) {
+              var singleData = JSON.parse(responses[k].getContentText());
+              var imageUrls = [];
+              if (Array.isArray(singleData.related_objects)) {
+                singleData.related_objects.forEach(function(obj) {
+                  if (obj.type === 'IMAGE' && obj.image_data && obj.image_data.url) {
+                    imageUrls.push(obj.image_data.url);
+                  }
+                });
+              }
+              if (imageUrls.length > 0) {
+                result[parallelBatch[k]] = imageUrls;
+              }
+            } else {
+              Logger.log("Individual image fetch error for " + parallelBatch[k] + ": HTTP " + responses[k].getResponseCode());
             }
-          });
-        }
-
-        if (imageUrls.length > 0) {
-          result[remainingItemIds[j]] = imageUrls;
+          } catch (e) {
+            Logger.log("Error parsing response for " + parallelBatch[k] + ": " + e.message);
+          }
         }
       } catch (e) {
-        Logger.log("Individual image fetch error for " + remainingItemIds[j] + ": " + e.message);
+        Logger.log("Parallel fetch error at index " + j + ": " + e.message);
       }
 
-      if (progressSheet && (j + 1) % 5 === 0) {
-        progressSheet.getRange('B8').setValue((j + 1) + ' / ' + remainingItemIds.length + ' items (individual phase)');
+      phase2bProcessed += parallelBatch.length;
+      if (progressSheet) {
+        progressSheet.getRange('B8').setValue(phase2bProcessed + ' / ' + remainingItemIds.length + ' items (individual phase)');
         SpreadsheetApp.flush();
       }
 
-      if (j < remainingItemIds.length - 1) {
-        Utilities.sleep(200);
+      // Throttle between parallel batches to respect API rate limits
+      if (j + PARALLEL_SIZE < remainingItemIds.length) {
+        Utilities.sleep(1000);
       }
     }
   }
@@ -789,11 +835,14 @@ function processAndWriteData(sheet, variationMap, locationIds, inventoryMap, pro
 
   for (var variationId in variationMap) {
     if (variationMap.hasOwnProperty(variationId)) {
-      var stopFlag = progressSheet.getRange('B5').getValue().toString().toUpperCase();
-      if (stopFlag === 'STOP') {
-        Logger.log('Processing halted by user.');
-        stopProcessing = true;
-        break;
+      // Check stop flag periodically (not every row — each read is a network round-trip)
+      if (variationsProcessed % 500 === 0) {
+        var stopFlag = progressSheet.getRange('B5').getValue().toString().toUpperCase();
+        if (stopFlag === 'STOP') {
+          Logger.log('Processing halted by user.');
+          stopProcessing = true;
+          break;
+        }
       }
 
       var variationData = variationMap[variationId];
