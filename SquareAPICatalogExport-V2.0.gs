@@ -105,11 +105,17 @@ function startProcessing() {
     progressSheet.getRange('A3').setValue('Progress (%):');
     progressSheet.getRange('A5').setValue('Type "STOP" in cell B5 to halt processing.');
     progressSheet.getRange('A6').setValue('Last Refreshed:');
+    progressSheet.getRange('A7').setValue('Status:');
+    progressSheet.getRange('A8').setValue('Phase Progress:');
 
     progressSheet.getRange('B5').setValue('');
     progressSheet.getRange('B6').setValue(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'));
+    progressSheet.getRange('B7').setValue('Starting...');
+    progressSheet.getRange('B8').setValue('');
+    SpreadsheetApp.flush();
 
     // Fetch all location IDs automatically
+    updateStatus(progressSheet, 'Fetching locations...', '');
     var locationIds = fetchLocationIds();
     if (!locationIds.length) {
       Logger.log("No locations found for the merchant.");
@@ -118,7 +124,8 @@ function startProcessing() {
     }
 
     // Fetch all catalog data
-    var catalogData = fetchAllCatalogData();
+    updateStatus(progressSheet, 'Fetching catalog data...', '');
+    var catalogData = fetchAllCatalogData(progressSheet);
     if (catalogData.items.length === 0) {
       displayAlert("No items found in the catalog.");
       return;
@@ -127,12 +134,15 @@ function startProcessing() {
     progressSheet.getRange('B1').setValue(catalogData.variationCount);
 
     // Create variation map with reliable image handling
-    var variationMap = buildVariationMapWithReliableImages(catalogData.items, catalogData.categoryMap, catalogData.imageMap);
+    updateStatus(progressSheet, 'Processing images...', '');
+    var variationMap = buildVariationMapWithReliableImages(catalogData.items, catalogData.categoryMap, catalogData.imageMap, progressSheet);
 
     // Fetch inventory counts for all variations
+    updateStatus(progressSheet, 'Fetching inventory...', '');
     var inventoryMap = fetchInventoryCountsForAllVariations(variationMap, locationIds, progressSheet);
 
     // Process variations and write data to the sheet
+    updateStatus(progressSheet, 'Writing data to sheet...', '');
     processAndWriteData(sheet, variationMap, locationIds, inventoryMap, progressSheet);
 
     // Send success email
@@ -216,15 +226,22 @@ function deleteExistingTriggers() {
 }
 
 // Function to fetch all catalog data
-function fetchAllCatalogData() {
+function fetchAllCatalogData(progressSheet) {
   var allItems = [];
   var categoryMap = {};
   var imageMap = {};
   var variationCount = 0;
   var cursor = null;
+  var pageCount = 0;
   var listCatalogUrl = 'https://connect.squareup.com/v2/catalog/list';
 
   do {
+    pageCount++;
+    if (progressSheet) {
+      progressSheet.getRange('B8').setValue('Page ' + pageCount + ' — ' + allItems.length + ' items so far');
+      SpreadsheetApp.flush();
+    }
+
     var response = fetchCatalogPage(listCatalogUrl, cursor);
 
     if (response.getResponseCode() === 200) {
@@ -340,7 +357,7 @@ function constructItemUrl(itemName, itemId, storeDomain) {
 // Reliable image processing function — two-pass approach
 // Pass 1: resolve images from the pre-built imageMap (zero API calls)
 // Pass 2: batch-retrieve remaining items that had no images (batches of 100)
-function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
+function buildVariationMapWithReliableImages(items, categoryMap, imageMap, progressSheet) {
   var variationMap = {};
   var itemsNeedingImages = []; // item IDs where Phase 1 found no images
 
@@ -478,7 +495,10 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
   // Phase 2: Batch-fetch images for items where Phase 1 found nothing
   if (itemsNeedingImages.length > 0) {
     Logger.log("Phase 2: Batch-fetching images for " + itemsNeedingImages.length + " items");
-    var batchImageResults = batchFetchItemImages(itemsNeedingImages);
+    if (progressSheet) {
+      updateStatus(progressSheet, 'Batch-fetching images...', '0 / ' + itemsNeedingImages.length + ' items');
+    }
+    var batchImageResults = batchFetchItemImages(itemsNeedingImages, progressSheet);
 
     // Update variationMap entries whose parent item now has images
     var updatedCount = 0;
@@ -508,13 +528,23 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
 // Phase 2b: individually fetch any remaining items without image_ids
 //           (single-item fetch is the only way to resolve images when image_ids is empty,
 //            because all related_objects can be attributed to that one item)
-function batchFetchItemImages(itemIds) {
+function batchFetchItemImages(itemIds, progressSheet) {
   var result = {}; // itemId -> [imageUrl, ...]
   var BATCH_SIZE = 100;
   var remainingItemIds = [];
+  var processedCount = 0;
 
   // Phase 2a: Batch retrieve — resolve images via image_ids
   for (var i = 0; i < itemIds.length; i += BATCH_SIZE) {
+    // Check stop flag
+    if (progressSheet) {
+      var stopFlag = progressSheet.getRange('B5').getValue().toString().toUpperCase();
+      if (stopFlag === 'STOP') {
+        Logger.log('Processing halted by user during image batch fetch.');
+        break;
+      }
+    }
+
     var batch = itemIds.slice(i, Math.min(i + BATCH_SIZE, itemIds.length));
 
     try {
@@ -556,6 +586,12 @@ function batchFetchItemImages(itemIds) {
       remainingItemIds = remainingItemIds.concat(batch);
     }
 
+    processedCount += batch.length;
+    if (progressSheet) {
+      progressSheet.getRange('B8').setValue(processedCount + ' / ' + itemIds.length + ' items (batch phase)');
+      SpreadsheetApp.flush();
+    }
+
     if (i + BATCH_SIZE < itemIds.length) {
       Utilities.sleep(500);
     }
@@ -565,8 +601,20 @@ function batchFetchItemImages(itemIds) {
   // When fetching a single item, all IMAGE related_objects belong to it
   if (remainingItemIds.length > 0) {
     Logger.log("Phase 2b: Individual image fetch for " + remainingItemIds.length + " items without image_ids");
+    if (progressSheet) {
+      updateStatus(progressSheet, 'Fetching individual images...', '0 / ' + remainingItemIds.length + ' items');
+    }
 
     for (var j = 0; j < remainingItemIds.length; j++) {
+      // Check stop flag every 10 items
+      if (progressSheet && j % 10 === 0) {
+        var stopFlag2 = progressSheet.getRange('B5').getValue().toString().toUpperCase();
+        if (stopFlag2 === 'STOP') {
+          Logger.log('Processing halted by user during individual image fetch.');
+          break;
+        }
+      }
+
       try {
         var singleData = catalogBatchRetrieve([remainingItemIds[j]]);
 
@@ -584,6 +632,11 @@ function batchFetchItemImages(itemIds) {
         }
       } catch (e) {
         Logger.log("Individual image fetch error for " + remainingItemIds[j] + ": " + e.message);
+      }
+
+      if (progressSheet && (j + 1) % 5 === 0) {
+        progressSheet.getRange('B8').setValue((j + 1) + ' / ' + remainingItemIds.length + ' items (individual phase)');
+        SpreadsheetApp.flush();
       }
 
       if (j < remainingItemIds.length - 1) {
@@ -807,6 +860,7 @@ function processAndWriteData(sheet, variationMap, locationIds, inventoryMap, pro
   progressSheet.getRange('B2').setValue(variationsProcessed);
   progressSheet.getRange('B3').setValue(100);
   progressSheet.getRange('B6').setValue(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'));
+  updateStatus(progressSheet, stopProcessing ? 'Stopped by user' : 'Complete', '');
   SpreadsheetApp.flush();
 
   if (!stopProcessing) {
@@ -908,6 +962,12 @@ function makeApiRequest(url, options) {
       throw new Error('API request failed with status code ' + statusCode);
     }
   }
+}
+
+function updateStatus(progressSheet, status, phaseProgress) {
+  progressSheet.getRange('B7').setValue(status);
+  progressSheet.getRange('B8').setValue(phaseProgress);
+  SpreadsheetApp.flush();
 }
 
 function displayAlert(message) {
