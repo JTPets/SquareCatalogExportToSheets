@@ -326,7 +326,8 @@ function constructItemUrl(itemName, itemId, storeDomain) {
 // Reliable image processing function
 function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
   var variationMap = {};
-  
+  var itemsNeedingImages = [];
+
   var documentProperties = PropertiesService.getDocumentProperties();
   var storeDomain = documentProperties.getProperty('STORE_DOMAIN');
 
@@ -337,10 +338,9 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
       var description = item.item_data.description || "";
       var itemUrl = constructItemUrl(itemName, itemId, storeDomain);
 
-      // Reliable image processing - only use methods that work
       var imageUrls = [];
-      
-      // Method 1: Check if item has image_ids
+
+      // Phase 1: Check if item has image_ids in the already-fetched imageMap
       if (Array.isArray(item.image_ids) && item.image_ids.length > 0) {
         item.image_ids.forEach(function(imageId) {
           if (imageMap[imageId] && imageMap[imageId].url) {
@@ -349,16 +349,9 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
         });
       }
 
-      // Method 2: If no direct image_ids, try batch retrieve
-      if (imageUrls.length === 0) {
-        try {
-          var fallbackImages = fetchItemWithImages(itemId);
-          if (fallbackImages && fallbackImages.length > 0) {
-            imageUrls = fallbackImages;
-          }
-        } catch (error) {
-          Logger.log("Error in batch retrieve for " + itemId + ": " + error.message);
-        }
+      // If no images resolved from imageMap, queue for batch fallback
+      if (imageUrls.length === 0 && itemId) {
+        itemsNeedingImages.push(itemId);
       }
 
       var primaryImageUrl = (imageUrls.length > 0) ? imageUrls[0] : "";
@@ -467,17 +460,48 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
     }
   });
 
+  // Phase 2: Batch fetch images for items that had no image_ids in imageMap
+  if (itemsNeedingImages.length > 0) {
+    Logger.log("Fetching images for " + itemsNeedingImages.length + " items via batch retrieve...");
+    var batchImageMap = fetchImagesInBatch(itemsNeedingImages);
+
+    var updatedCount = 0;
+    for (var variationId in variationMap) {
+      if (variationMap.hasOwnProperty(variationId)) {
+        var vData = variationMap[variationId];
+        if (vData.images[0] === "") {
+          var itemImages = batchImageMap[vData.itemId];
+          if (itemImages && itemImages.length > 0) {
+            vData.images = [
+              itemImages[0] || "",
+              itemImages[1] || "",
+              itemImages[2] || ""
+            ];
+            updatedCount++;
+          }
+        }
+      }
+    }
+    Logger.log("Updated images for " + updatedCount + " variations from batch retrieve.");
+  }
+
   return variationMap;
 }
 
-function fetchItemWithImages(itemId) {
-  try {
+// Batch fetch images for items without image_ids (100 items per call instead of 1)
+function fetchImagesInBatch(itemIds) {
+  var imagesByItemId = {};
+  var batchSize = 100;
+
+  for (var i = 0; i < itemIds.length; i += batchSize) {
+    var batch = itemIds.slice(i, Math.min(i + batchSize, itemIds.length));
+
     var url = 'https://connect.squareup.com/v2/catalog/batch-retrieve';
     var payload = {
-      "object_ids": [itemId],
+      "object_ids": batch,
       "include_related_objects": true
     };
-    
+
     var options = {
       "method": "POST",
       "headers": {
@@ -487,27 +511,54 @@ function fetchItemWithImages(itemId) {
       "payload": JSON.stringify(payload),
       "muteHttpExceptions": true
     };
-    
-    var response = makeApiRequest(url, options);
-    if (response.getResponseCode() === 200) {
-      var data = JSON.parse(response.getContentText());
-      
-      var imageUrls = [];
-      
-      if (Array.isArray(data.related_objects)) {
-        data.related_objects.forEach(function(obj) {
-          if (obj.type === 'IMAGE' && obj.image_data && obj.image_data.url) {
-            imageUrls.push(obj.image_data.url);
-          }
-        });
+
+    try {
+      var response = makeApiRequest(url, options);
+      if (response.getResponseCode() === 200) {
+        var data = JSON.parse(response.getContentText());
+
+        // Build image ID -> URL map from related_objects
+        var relatedImageMap = {};
+        if (Array.isArray(data.related_objects)) {
+          data.related_objects.forEach(function(obj) {
+            if (obj.type === 'IMAGE' && obj.image_data && obj.image_data.url) {
+              relatedImageMap[obj.id] = obj.image_data.url;
+            }
+          });
+        }
+
+        // Map each item to its resolved image URLs
+        if (Array.isArray(data.objects)) {
+          data.objects.forEach(function(obj) {
+            if (obj.type === 'ITEM') {
+              var urls = [];
+              if (Array.isArray(obj.image_ids)) {
+                obj.image_ids.forEach(function(imgId) {
+                  if (relatedImageMap[imgId]) {
+                    urls.push(relatedImageMap[imgId]);
+                  }
+                });
+              }
+              if (urls.length > 0) {
+                imagesByItemId[obj.id] = urls;
+              }
+            }
+          });
+        }
+      } else {
+        Logger.log("Error in batch image retrieve at index " + i + ": " + response.getContentText());
       }
-      
-      return imageUrls;
+    } catch (error) {
+      Logger.log("Error in fetchImagesInBatch at index " + i + ": " + error.message);
     }
-  } catch (error) {
-    Logger.log("Error in fetchItemWithImages: " + error.message);
+
+    if (i + batchSize < itemIds.length) {
+      Utilities.sleep(500);
+    }
   }
-  return [];
+
+  Logger.log("Batch image retrieve complete. Found images for " + Object.keys(imagesByItemId).length + " items.");
+  return imagesByItemId;
 }
 
 // Fetch inventory counts using batch endpoint (100 variations per call instead of 1)
