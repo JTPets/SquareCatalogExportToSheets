@@ -105,11 +105,17 @@ function startProcessing() {
     progressSheet.getRange('A3').setValue('Progress (%):');
     progressSheet.getRange('A5').setValue('Type "STOP" in cell B5 to halt processing.');
     progressSheet.getRange('A6').setValue('Last Refreshed:');
+    progressSheet.getRange('A7').setValue('Status:');
+    progressSheet.getRange('A8').setValue('Phase Progress:');
 
     progressSheet.getRange('B5').setValue('');
     progressSheet.getRange('B6').setValue(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'));
+    progressSheet.getRange('B7').setValue('Starting...');
+    progressSheet.getRange('B8').setValue('');
+    SpreadsheetApp.flush();
 
     // Fetch all location IDs automatically
+    updateStatus(progressSheet, 'Fetching locations...', '');
     var locationIds = fetchLocationIds();
     if (!locationIds.length) {
       Logger.log("No locations found for the merchant.");
@@ -118,7 +124,8 @@ function startProcessing() {
     }
 
     // Fetch all catalog data
-    var catalogData = fetchAllCatalogData();
+    updateStatus(progressSheet, 'Fetching catalog data...', '');
+    var catalogData = fetchAllCatalogData(progressSheet);
     if (catalogData.items.length === 0) {
       displayAlert("No items found in the catalog.");
       return;
@@ -127,12 +134,15 @@ function startProcessing() {
     progressSheet.getRange('B1').setValue(catalogData.variationCount);
 
     // Create variation map with reliable image handling
-    var variationMap = buildVariationMapWithReliableImages(catalogData.items, catalogData.categoryMap, catalogData.imageMap);
+    updateStatus(progressSheet, 'Processing images...', '');
+    var variationMap = buildVariationMapWithReliableImages(catalogData.items, catalogData.categoryMap, catalogData.imageMap, progressSheet);
 
     // Fetch inventory counts for all variations
+    updateStatus(progressSheet, 'Fetching inventory...', '');
     var inventoryMap = fetchInventoryCountsForAllVariations(variationMap, locationIds, progressSheet);
 
     // Process variations and write data to the sheet
+    updateStatus(progressSheet, 'Writing data to sheet...', '');
     processAndWriteData(sheet, variationMap, locationIds, inventoryMap, progressSheet);
 
     // Send success email
@@ -216,15 +226,22 @@ function deleteExistingTriggers() {
 }
 
 // Function to fetch all catalog data
-function fetchAllCatalogData() {
+function fetchAllCatalogData(progressSheet) {
   var allItems = [];
   var categoryMap = {};
   var imageMap = {};
   var variationCount = 0;
   var cursor = null;
+  var pageCount = 0;
   var listCatalogUrl = 'https://connect.squareup.com/v2/catalog/list';
 
   do {
+    pageCount++;
+    if (progressSheet) {
+      progressSheet.getRange('B8').setValue('Page ' + pageCount + ' — ' + allItems.length + ' items so far');
+      SpreadsheetApp.flush();
+    }
+
     var response = fetchCatalogPage(listCatalogUrl, cursor);
 
     if (response.getResponseCode() === 200) {
@@ -247,6 +264,20 @@ function fetchAllCatalogData() {
                 caption: obj.image_data.caption || ""
               };
             }
+          }
+        });
+      }
+
+      // Also capture IMAGE objects from related_objects (may include images
+      // not returned as top-level objects on the current page)
+      if (Array.isArray(jsonData.related_objects) && jsonData.related_objects.length > 0) {
+        jsonData.related_objects.forEach(function(obj) {
+          if (obj.type === 'IMAGE' && obj.image_data && obj.image_data.url && !imageMap[obj.id]) {
+            imageMap[obj.id] = {
+              url: obj.image_data.url,
+              name: obj.image_data.name || "",
+              caption: obj.image_data.caption || ""
+            };
           }
         });
       }
@@ -323,9 +354,12 @@ function constructItemUrl(itemName, itemId, storeDomain) {
   return "https://" + storeDomain + "/product/" + slug + "/" + itemId;
 }
 
-// Reliable image processing function
-function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
+// Reliable image processing function — two-pass approach
+// Pass 1: resolve images from the pre-built imageMap (zero API calls)
+// Pass 2: batch-retrieve remaining items that had no images (batches of 100)
+function buildVariationMapWithReliableImages(items, categoryMap, imageMap, progressSheet) {
   var variationMap = {};
+  var itemsNeedingImages = []; // item IDs where Phase 1 found no images
 
   var documentProperties = PropertiesService.getDocumentProperties();
   var storeDomain = documentProperties.getProperty('STORE_DOMAIN');
@@ -348,16 +382,8 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
         });
       }
 
-      // Fallback: fetch item individually to get images from related_objects
       if (imageUrls.length === 0) {
-        try {
-          var fallbackImages = fetchItemWithImages(itemId);
-          if (fallbackImages && fallbackImages.length > 0) {
-            imageUrls = fallbackImages;
-          }
-        } catch (error) {
-          Logger.log("Error in image retrieve for " + itemId + ": " + error.message);
-        }
+        itemsNeedingImages.push(itemId);
       }
 
       var primaryImageUrl = (imageUrls.length > 0) ? imageUrls[0] : "";
@@ -466,50 +492,189 @@ function buildVariationMapWithReliableImages(items, categoryMap, imageMap) {
     }
   });
 
+  // Phase 2: Batch-fetch images for items where Phase 1 found nothing
+  if (itemsNeedingImages.length > 0) {
+    Logger.log("Phase 2: Batch-fetching images for " + itemsNeedingImages.length + " items");
+    if (progressSheet) {
+      updateStatus(progressSheet, 'Batch-fetching images...', '0 / ' + itemsNeedingImages.length + ' items');
+    }
+    var batchImageResults = batchFetchItemImages(itemsNeedingImages, progressSheet);
+
+    // Update variationMap entries whose parent item now has images
+    var updatedCount = 0;
+    for (var variationId in variationMap) {
+      if (variationMap.hasOwnProperty(variationId)) {
+        var vData = variationMap[variationId];
+        if (vData.images[0] === "" && batchImageResults[vData.itemId]) {
+          var newImages = batchImageResults[vData.itemId];
+          vData.images = [
+            newImages[0] || "",
+            newImages[1] || "",
+            newImages[2] || ""
+          ];
+          updatedCount++;
+        }
+      }
+    }
+    Logger.log("Phase 2 complete. Found images for " + Object.keys(batchImageResults).length +
+               " of " + itemsNeedingImages.length + " items (" + updatedCount + " variations updated)");
+  }
+
   return variationMap;
 }
 
-// Fetch images for a single item via batch-retrieve with related_objects
-// Per-item fetch is required because items without image_ids can only resolve
-// images when all related_objects belong to a single item
-function fetchItemWithImages(itemId) {
-  try {
-    var url = 'https://connect.squareup.com/v2/catalog/batch-retrieve';
-    var payload = {
-      "object_ids": [itemId],
-      "include_related_objects": true
-    };
+// Batch-fetch images for multiple items using catalog/batch-retrieve
+// Phase 2a: batch up to 100 items and match images via image_ids in the response
+// Phase 2b: individually fetch any remaining items without image_ids
+//           (single-item fetch is the only way to resolve images when image_ids is empty,
+//            because all related_objects can be attributed to that one item)
+function batchFetchItemImages(itemIds, progressSheet) {
+  var result = {}; // itemId -> [imageUrl, ...]
+  var BATCH_SIZE = 100;
+  var remainingItemIds = [];
+  var processedCount = 0;
 
-    var options = {
-      "method": "POST",
-      "headers": {
-        "Square-Version": "2023-10-18",
-        "Content-Type": "application/json"
-      },
-      "payload": JSON.stringify(payload),
-      "muteHttpExceptions": true
-    };
+  // Phase 2a: Batch retrieve — resolve images via image_ids
+  for (var i = 0; i < itemIds.length; i += BATCH_SIZE) {
+    // Check stop flag
+    if (progressSheet) {
+      var stopFlag = progressSheet.getRange('B5').getValue().toString().toUpperCase();
+      if (stopFlag === 'STOP') {
+        Logger.log('Processing halted by user during image batch fetch.');
+        break;
+      }
+    }
 
-    var response = makeApiRequest(url, options);
-    if (response.getResponseCode() === 200) {
-      var data = JSON.parse(response.getContentText());
+    var batch = itemIds.slice(i, Math.min(i + BATCH_SIZE, itemIds.length));
 
-      var imageUrls = [];
+    try {
+      var data = catalogBatchRetrieve(batch);
 
+      // Build image lookup from related_objects in this batch response
+      var batchImageLookup = {};
       if (Array.isArray(data.related_objects)) {
         data.related_objects.forEach(function(obj) {
           if (obj.type === 'IMAGE' && obj.image_data && obj.image_data.url) {
-            imageUrls.push(obj.image_data.url);
+            batchImageLookup[obj.id] = obj.image_data.url;
           }
         });
       }
 
-      return imageUrls;
+      // Match images to items using image_ids from the batch-retrieve response
+      // (image_ids may be populated here even when absent from catalog/list)
+      if (Array.isArray(data.objects)) {
+        data.objects.forEach(function(obj) {
+          if (obj.type === 'ITEM') {
+            var urls = [];
+            if (Array.isArray(obj.image_ids) && obj.image_ids.length > 0) {
+              obj.image_ids.forEach(function(imgId) {
+                if (batchImageLookup[imgId]) {
+                  urls.push(batchImageLookup[imgId]);
+                }
+              });
+            }
+            if (urls.length > 0) {
+              result[obj.id] = urls;
+            } else {
+              remainingItemIds.push(obj.id);
+            }
+          }
+        });
+      }
+    } catch (e) {
+      Logger.log("Batch image fetch error at index " + i + ": " + e.message);
+      remainingItemIds = remainingItemIds.concat(batch);
     }
-  } catch (error) {
-    Logger.log("Error in fetchItemWithImages: " + error.message);
+
+    processedCount += batch.length;
+    if (progressSheet) {
+      progressSheet.getRange('B8').setValue(processedCount + ' / ' + itemIds.length + ' items (batch phase)');
+      SpreadsheetApp.flush();
+    }
+
+    if (i + BATCH_SIZE < itemIds.length) {
+      Utilities.sleep(500);
+    }
   }
-  return [];
+
+  // Phase 2b: Individual fetch for items that still lack image_ids
+  // When fetching a single item, all IMAGE related_objects belong to it
+  if (remainingItemIds.length > 0) {
+    Logger.log("Phase 2b: Individual image fetch for " + remainingItemIds.length + " items without image_ids");
+    if (progressSheet) {
+      updateStatus(progressSheet, 'Fetching individual images...', '0 / ' + remainingItemIds.length + ' items');
+    }
+
+    for (var j = 0; j < remainingItemIds.length; j++) {
+      // Check stop flag every 10 items
+      if (progressSheet && j % 10 === 0) {
+        var stopFlag2 = progressSheet.getRange('B5').getValue().toString().toUpperCase();
+        if (stopFlag2 === 'STOP') {
+          Logger.log('Processing halted by user during individual image fetch.');
+          break;
+        }
+      }
+
+      try {
+        var singleData = catalogBatchRetrieve([remainingItemIds[j]]);
+
+        var imageUrls = [];
+        if (Array.isArray(singleData.related_objects)) {
+          singleData.related_objects.forEach(function(obj) {
+            if (obj.type === 'IMAGE' && obj.image_data && obj.image_data.url) {
+              imageUrls.push(obj.image_data.url);
+            }
+          });
+        }
+
+        if (imageUrls.length > 0) {
+          result[remainingItemIds[j]] = imageUrls;
+        }
+      } catch (e) {
+        Logger.log("Individual image fetch error for " + remainingItemIds[j] + ": " + e.message);
+      }
+
+      if (progressSheet && (j + 1) % 5 === 0) {
+        progressSheet.getRange('B8').setValue((j + 1) + ' / ' + remainingItemIds.length + ' items (individual phase)');
+        SpreadsheetApp.flush();
+      }
+
+      if (j < remainingItemIds.length - 1) {
+        Utilities.sleep(200);
+      }
+    }
+  }
+
+  Logger.log("Batch image fetch complete. Found images for " +
+             Object.keys(result).length + " of " + itemIds.length + " items");
+  return result;
+}
+
+// Helper: call catalog/batch-retrieve for a list of object IDs
+function catalogBatchRetrieve(objectIds) {
+  var url = 'https://connect.squareup.com/v2/catalog/batch-retrieve';
+  var payload = {
+    "object_ids": objectIds,
+    "include_related_objects": true
+  };
+
+  var options = {
+    "method": "POST",
+    "headers": {
+      "Square-Version": "2023-10-18",
+      "Content-Type": "application/json"
+    },
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true
+  };
+
+  var response = makeApiRequest(url, options);
+
+  if (response.getResponseCode() === 200) {
+    return JSON.parse(response.getContentText());
+  }
+
+  throw new Error("batch-retrieve failed with status " + response.getResponseCode());
 }
 
 // Fetch inventory counts using batch endpoint (100 variations per call instead of 1)
@@ -695,6 +860,7 @@ function processAndWriteData(sheet, variationMap, locationIds, inventoryMap, pro
   progressSheet.getRange('B2').setValue(variationsProcessed);
   progressSheet.getRange('B3').setValue(100);
   progressSheet.getRange('B6').setValue(Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'));
+  updateStatus(progressSheet, stopProcessing ? 'Stopped by user' : 'Complete', '');
   SpreadsheetApp.flush();
 
   if (!stopProcessing) {
@@ -796,6 +962,12 @@ function makeApiRequest(url, options) {
       throw new Error('API request failed with status code ' + statusCode);
     }
   }
+}
+
+function updateStatus(progressSheet, status, phaseProgress) {
+  progressSheet.getRange('B7').setValue(status);
+  progressSheet.getRange('B8').setValue(phaseProgress);
+  SpreadsheetApp.flush();
 }
 
 function displayAlert(message) {
